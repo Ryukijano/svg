@@ -14,7 +14,7 @@ from skimage.metrics import peak_signal_noise_ratio as psnr_metric
 from skimage.metrics import structural_similarity as ssim_metric
 from scipy import signal
 from scipy import ndimage
-from PIL import Image, ImageDraw
+from PIL.Image as Image
 
 
 from torchvision import datasets, transforms
