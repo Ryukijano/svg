@@ -5,22 +5,18 @@ import argparse
 import os
 import numpy as np
 from sklearn.manifold import TSNE
-import scipy.misc
 import matplotlib
 matplotlib.use('agg')
 import matplotlib.pyplot as plt
 import functools
 from skimage.metrics import peak_signal_noise_ratio as psnr_metric
 from skimage.metrics import structural_similarity as ssim_metric
-from scipy import signal
-from scipy import ndimage
-from PIL.Image as Image
-
-
+from scipy import ndimage, signal
+from PIL import Image, ImageDraw
 from torchvision import datasets, transforms
 from torch.autograd import Variable
 import imageio
-
+from tqdm import tqdm
 
 hostname = socket.gethostname()
 
@@ -72,7 +68,7 @@ def sequence_input(seq, dtype):
     return [Variable(x.type(dtype)) for x in seq]
 
 def normalize_data(opt, dtype, sequence):
-    if opt.dataset == 'smmnist' or opt.dataset == 'kth' or opt.dataset == 'bair' :
+    if opt.dataset in ['smmnist', 'kth', 'bair']:
         sequence.transpose_(0, 1)
         sequence.transpose_(3, 4).transpose_(2, 3)
     else:
@@ -88,11 +84,8 @@ def is_sequence(arg):
             hasattr(arg, "__iter__")))
 
 def image_tensor(inputs, padding=1):
-    # assert is_sequence(inputs)
     assert len(inputs) > 0
-    # print(inputs)
 
-    # if this is a list of lists, unpack them all and grid them up
     if is_sequence(inputs[0]) or (hasattr(inputs, "dim") and inputs.dim() > 4):
         images = [image_tensor(x) for x in inputs]
         if images[0].dim() == 3:
@@ -113,11 +106,8 @@ def image_tensor(inputs, padding=1):
 
         return result
 
-    # if this is just a list, make a stacked image
     else:
-        images = [x.data if isinstance(x, torch.autograd.Variable) else x
-                  for x in inputs]
-        # print(images)
+        images = [x.data if isinstance(x, torch.autograd.Variable) else x for x in inputs]
         if images[0].dim() == 3:
             c_dim = images[0].size(0)
             x_dim = images[0].size(1)
@@ -135,22 +125,19 @@ def image_tensor(inputs, padding=1):
                    (i+1) * y_dim + i * padding].copy_(image)
         return result
 
+
 def save_np_img(fname, x):
     if x.shape[0] == 1:
         x = np.tile(x, (3, 1, 1))
-    img = scipy.misc.toimage(x,
-                             high=255*x.max(),
-                             channel_axis=0)
+    img = Image.fromarray((x * 255).astype(np.uint8).transpose(1, 2, 0))
     img.save(fname)
 
 def make_image(tensor):
     tensor = tensor.cpu().clamp(0, 1)
     if tensor.size(0) == 1:
         tensor = tensor.expand(3, tensor.size(1), tensor.size(2))
-    # pdb.set_trace()
-    return scipy.misc.toimage(tensor.numpy(),
-                              high=255*tensor.max(),
-                              channel_axis=0)
+    img = Image.fromarray((tensor.numpy() * 255).astype(np.uint8).transpose(1, 2, 0))
+    return img
 
 def draw_text_tensor(tensor, text):
     np_x = tensor.transpose(0, 1).transpose(1, 2).data.cpu().numpy()
@@ -164,10 +151,13 @@ def save_gif(filename, inputs, duration=0.25):
     images = []
     for tensor in inputs:
         img = image_tensor(tensor, padding=0)
-        img = img.cpu()
-        img = img.transpose(0,1).transpose(1,2).clamp(0,1)
-        images.append(img.numpy())
+        img = img.cpu().numpy()
+        if img.ndim == 3 and img.shape[0] == 1:
+            img = img.squeeze(0)
+        img = (img * 255).astype(np.uint8)
+        images.append(img)
     imageio.mimsave(filename, images, duration=duration)
+
 
 def save_gif_with_text(filename, inputs, text, duration=0.25):
     images = []
@@ -175,7 +165,7 @@ def save_gif_with_text(filename, inputs, text, duration=0.25):
         img = image_tensor([draw_text_tensor(ti, texti) for ti, texti in zip(tensor, text)], padding=0)
         img = img.cpu()
         img = img.transpose(0,1).transpose(1,2).clamp(0,1).numpy()
-        images.append(img)
+        images.append((img * 255).astype(np.uint8))
     imageio.mimsave(filename, images, duration=duration)
 
 def save_image(filename, tensor):
@@ -222,51 +212,12 @@ def eval_seq(gt, pred):
 
     return mse, ssim, psnr
 
-# ssim function used in Babaeizadeh et al. (2017), Fin et al. (2016), etc.
-def finn_eval_seq(gt, pred):
-    T = len(gt)
-    bs = gt[0].shape[0]
-    ssim = np.zeros((bs, T))
-    psnr = np.zeros((bs, T))
-    mse = np.zeros((bs, T))
-    for i in range(bs):
-        for t in range(T):
-            for c in range(gt[t][i].shape[0]):
-                res = finn_ssim(gt[t][i][c], pred[t][i][c]).mean()
-                if math.isnan(res):
-                    ssim[i, t] += -1
-                else:
-                    ssim[i, t] += res
-                psnr[i, t] += finn_psnr(gt[t][i][c], pred[t][i][c])
-            ssim[i, t] /= gt[t][i].shape[0]
-            psnr[i, t] /= gt[t][i].shape[0]
-            mse[i, t] = mse_metric(gt[t][i], pred[t][i])
-
-    return mse, ssim, psnr
-
-
-def finn_psnr(x, y):
-    mse = ((x - y)**2).mean()
-    return 10*np.log(1/mse)/np.log(10)
-
-
-def gaussian2(size, sigma):
-    A = 1/(2.0*np.pi*sigma**2)
-    x, y = np.mgrid[-size//2 + 1:size//2 + 1, -size//2 + 1:size//2 + 1]
-    g = A*np.exp(-((x**2/(2.0*sigma**2))+(y**2/(2.0*sigma**2))))
-    return g
-
-def fspecial_gauss(size, sigma):
-    x, y = np.mgrid[-size//2 + 1:size//2 + 1, -size//2 + 1:size//2 + 1]
-    g = np.exp(-((x**2 + y**2)/(2.0*sigma**2)))
-    return g/g.sum()
-  
 def finn_ssim(img1, img2, cs_map=False):
     img1 = img1.astype(np.float64)
     img2 = img2.astype(np.float64)
     size = 11
     sigma = 1.5
-    window = fspecial_gauss(size, sigma)
+    window = gaussian2(size, sigma)
     K1 = 0.01
     K2 = 0.03
     L = 1 #bitdepth of image
@@ -288,7 +239,6 @@ def finn_ssim(img1, img2, cs_map=False):
         return ((2*mu1_mu2 + C1)*(2*sigma12 + C2))/((mu1_sq + mu2_sq + C1)*
                     (sigma1_sq + sigma2_sq + C2))
 
-
 def init_weights(m):
     classname = m.__class__.__name__
     if classname.find('Conv') != -1 or classname.find('Linear') != -1:
@@ -297,4 +247,3 @@ def init_weights(m):
     elif classname.find('BatchNorm') != -1:
         m.weight.data.normal_(1.0, 0.02)
         m.bias.data.fill_(0)
-
